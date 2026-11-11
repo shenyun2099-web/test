@@ -59,6 +59,14 @@ jobs:
             curl.exe -sS --max-time 600 -o client-src.zip "$env:SITE_URL/api/gh_build/source?token=$env:UPLOAD_TOKEN"
             $sz = (Test-Path client-src.zip) ? (Get-Item client-src.zip).Length : 0
             Write-Host "curl exit=$LASTEXITCODE zip size=$sz"
+            # 2026-11-11: 失败时必须把服务器实际返回的内容打进日志, 否则只能瞎猜
+            # (214 字节事故: 服务器返回了 214 字节的报错页, 日志里只有 size 看不出是什么)
+            if ($sz -gt 0 -and $sz -le 4096) {
+              $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path client-src.zip))
+              $hex = ($bytes | Select-Object -First 160 | ForEach-Object { $_.ToString('x2') }) -join ''
+              Write-Host "resp_hex160=$hex"
+              Write-Host ("resp_text=" + [System.Text.Encoding]::UTF8.GetString($bytes))
+            }
             # 跨太平洋链路偶发截断(curl 18), 差几 KB 也过不了 size 关 → 必须验 zip 中央目录
             if ($sz -gt 100000 -and $LASTEXITCODE -eq 0) {
               try {
@@ -71,7 +79,7 @@ jobs:
             Remove-Item client-src.zip -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 10
           }
-          if (-not $ok) { throw '下载客户端源码 zip 失败(重试后仍不完整)' }
+          if (-not $ok) { throw "下载客户端源码 zip 失败(重试后仍不完整, last_size=$sz, resp_text 见上方日志)" }
           Expand-Archive client-src.zip -DestinationPath client-src -Force
           Get-ChildItem client-src | Select-Object Name, Length | Format-Table | Out-String | Write-Host
 
