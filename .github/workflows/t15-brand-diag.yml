@@ -1,0 +1,122 @@
+# t15 品牌解析诊断 workflow v2: 直接运行安装包内【真实下发的 brand_reader.ps1】
+# 在 Windows PowerShell 5.1 下复现退出码 1, 同时抓:
+#   1) 安装器自身安装期产生的 %LOCALAPPDATA%\ms-playwright\doubao_brand_reader.log
+#      (脚本内置逐阶段 trace, 失败点直接写在里面)
+#   2) 直接运行下发脚本副本的 stdout/stderr/退出码 (PS5.1 + PS7 双通道对照)
+#   3) 下发脚本前 96 字节 hex dump (核对 BOM/编码/行结尾)
+#   4) diagout 产物(brand.ini/json/ico 是否落盘)
+# 触发: 服务器 workflow_dispatch 下发 inputs
+name: t15-brand-diag
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'test15 站点地址'
+        required: true
+      agent_token:
+        description: '代理下载令牌(短TTL)'
+        required: true
+      build_id:
+        description: 'builds.id'
+        required: true
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download installer artifact
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dst = 'installer.exe'
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+            $sz = (Test-Path $dst) ? (Get-Item $dst).Length : 0
+            Write-Host "download try $i exit=$LASTEXITCODE size=$sz"
+            if ($LASTEXITCODE -eq 0 -and $sz -gt 100MB) { $ok = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw 'installer download failed (<100MB)' }
+
+      - name: Run installer silently (captures install-time brand trace)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 't15_install.log'
+          $p = Start-Process -FilePath (Resolve-Path 'installer.exe') `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" `
+            -Wait -PassThru
+          Write-Host "installer exit code = $($p.ExitCode)"
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          Write-Host '========== install-time brand_reader trace (from installer run) =========='
+          if (Test-Path $trace) { Get-Content -LiteralPath $trace | Write-Host } else { Write-Host '!! trace log NOT created (script died before Init-BrandLog write or log write failed)' }
+
+      - name: Run shipped brand_reader.ps1 directly under PS5.1 and PS7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $shipped = Join-Path $env:ProgramFiles 'doubaoClient\brand_reader.ps1'
+          if (-not (Test-Path -LiteralPath $shipped)) { throw "shipped script not found: $shipped" }
+
+          Write-Host '========== shipped script head bytes (hex) =========='
+          $bytes = [System.IO.File]::ReadAllBytes($shipped)
+          $head = ($bytes | Select-Object -First 96 | ForEach-Object { $_.ToString('x2') }) -join ' '
+          Write-Host $head
+          Write-Host ("total_bytes={0} has_bom={1} crlf_count={2}" -f $bytes.Length, `
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF), `
+            ([regex]::Matches([System.Text.Encoding]::ASCII.GetString($bytes), "`r`n")).Count)
+
+          New-Item -ItemType Directory -Force -Path 'diagout' | Out-Null
+          $installer = (Resolve-Path 'installer.exe').Path
+          foreach ($ps in @('powershell.exe','pwsh.exe')) {
+            $tag = $ps -replace '\.exe$',''
+            $out = Join-Path $env:RUNNER_TEMP ("run_{0}_out.txt" -f $tag)
+            $err = Join-Path $env:RUNNER_TEMP ("run_{0}_err.txt" -f $tag)
+            Remove-Item $out,$err -Force -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $ps `
+              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Resolve-Path $shipped).Path, `
+                '-ExePath',$installer,'-OutDir',(Resolve-Path 'diagout').Path `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            Write-Host ("========== {0} exit={1} ==========" -f $ps, $p.ExitCode)
+            Write-Host "--- stdout ---"
+            if (Test-Path $out) { Get-Content $out | Write-Host }
+            Write-Host "--- stderr ---"
+            if (Test-Path $err) { Get-Content $err | Write-Host }
+          }
+
+          Write-Host '========== direct-run trace (appended) =========='
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path $trace) { Get-Content -LiteralPath $trace | Write-Host }
+
+          Write-Host '========== diagout dir =========='
+          Get-ChildItem 'diagout' | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+          if (Test-Path 'diagout\brand.ini') {
+            Write-Host '--- brand.ini content ---'
+            Get-Content 'diagout\brand.ini' | Write-Host
+          }
+          Copy-Item $shipped -Destination 'shipped_brand_reader.ps1' -Force
+          Copy-Item $trace -Destination 'shipped_run_trace.log' -Force -ErrorAction SilentlyContinue
+
+      - name: Upload diag evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brand-diag-evidence
+          path: |
+            shipped_brand_reader.ps1
+            shipped_run_trace.log
+            diagout/
+            ${{ runner.temp }}/t15_install.log
+            ${{ runner.temp }}/run_powershell_out.txt
+            ${{ runner.temp }}/run_powershell_err.txt
+            ${{ runner.temp }}/run_pwsh_out.txt
+            ${{ runner.temp }}/run_pwsh_err.txt
+          retention-days: 7
+          if-no-files-found: ignore
