@@ -1,0 +1,465 @@
+# test15 安装器产物真实验证 workflow(由服务器推送/触发, 独立于构建链路)
+#
+# 目的: 在真实 Windows 上静默安装代理品牌产物, 拿安装日志 + 落地结果的一手证据,
+#       不再依赖"代码看起来对"。用户侧反复反馈"客户端 exe 无品牌/注册缺代理信息"
+#       的根因定位专用。
+# 触发: 服务器 workflow_dispatch 下发 inputs
+# 验证项:
+#   0) 下载产物完整性(大小 + 尾部品牌 trailer 字节存在)
+#   1) {app} 内客户端 exe 按品牌改名(<品牌名>.exe), 旧名 doubaoClient.exe 不存在
+#   2) {app}\brand.json 存在且 agent_code/app_name 正确(客户端 brand.py 第一优先级)
+#   3) 客户端 exe 尾部有品牌 trailer(brand.py read_brand_tail 同规则逐字节解析)
+#   4) 客户端 exe VersionInfo 品牌化(ProductName/FileDescription/FileVersion)
+#   5) Chromium 落地约定路径 ms-playwright\chromium-1134\chrome-win(64)\chrome.exe
+#   6) 卸载注册表 DisplayName = 品牌名
+#   7) 静默卸载: 退出码 0 + 日志无 unknown constant + 品牌 exe/brand.* 补删干净
+# 证据: Inno /LOG 完整安装日志 + 卸载日志 + 校验报告 + {app} 目录清单 全部传 GH artifact
+
+name: t15-install-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'test15 站点地址(示例 https://test15.5ghcy.com)'
+        required: true
+      agent_token:
+        description: '代理下载令牌(服务器临时签发, 短 TTL)'
+        required: true
+      build_id:
+        description: '要验证的 agent builds.id'
+        required: true
+      expect_app_name:
+        description: '期望的品牌应用名(示例 豆包厉害工作台)'
+        required: true
+      expect_agent_code:
+        description: '期望 agent_code'
+        required: false
+        default: 'AGAE3AVH'
+      expect_version:
+        description: '期望版本号(示例 1.0.13)'
+        required: false
+        default: ''
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download installer artifact
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dst = 'installer.exe'
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "download try $i ..."
+            curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 `
+              -o $dst "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+            $sz = (Test-Path $dst) ? (Get-Item $dst).Length : 0
+            Write-Host "curl exit=$LASTEXITCODE size=$sz"
+            if ($LASTEXITCODE -eq 0 -and $sz -gt 100MB) { $ok = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw '安装包下载失败/不完整(<100MB)' }
+          # 完整性: 尾部品牌 trailer 必须字节级存在(服务器注入层)
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $dst))
+          $read = [int][Math]::Min(2MB, $fs.Length)
+          $fs.Seek($fs.Length - $read, 'Begin') | Out-Null
+          $tail = New-Object byte[] $read
+          [void]$fs.Read($tail, 0, $read)
+          $fs.Close()
+          $txt = [System.Text.Encoding]::GetEncoding(28591).GetString($tail)
+          $mark = '<<<T15BRAND_V1>>>'
+          if ($txt.LastIndexOf($mark) -lt 0) { throw '安装器尾部未找到品牌 trailer(服务器注入层失败?)' }
+          Write-Host "下载产物 OK: size=$sz, 尾部品牌 trailer 存在"
+
+      - name: Run installer (VERYSILENT with full log)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 't15_install.log'
+          $p = Start-Process -FilePath (Resolve-Path 'installer.exe') `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" `
+            -Wait -PassThru
+          Write-Host "installer exit code = $($p.ExitCode)"
+          if (Test-Path $log) {
+            Write-Host '--- 安装日志最后 300 行 ---'
+            Get-Content $log -Tail 300 | Write-Host
+          } else {
+            Write-Host '!! 未生成安装日志'
+          }
+          if ($p.ExitCode -ne 0) { throw "安装器退出码 $($p.ExitCode)" }
+
+      - name: Verify branding outcome
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+          EXPECT_AGENT_CODE: ${{ inputs.expect_agent_code }}
+          EXPECT_VERSION: ${{ inputs.expect_version }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $script:failed = $false
+          $script:report = @()
+          function Add-Check([string]$name, [bool]$ok, [string]$detail) {
+            $tag = $(if ($ok) { 'PASS' } else { 'FAIL' })
+            $script:report += ('[{0}] {1} :: {2}' -f $tag, $name, $detail)
+            if (-not $ok) { $script:failed = $true }
+          }
+
+          Write-Host "--- {app} 目录清单 ---"
+          Get-ChildItem -LiteralPath $app -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+          # 1) 客户端 exe 按品牌改名
+          $brandExe = Join-Path $app "$env:EXPECT_APP_NAME.exe"
+          Add-Check '客户端 exe 按品牌改名' (Test-Path -LiteralPath $brandExe) $brandExe
+          $oldExe = Join-Path $app 'doubaoClient.exe'
+          Add-Check '旧名 doubaoClient.exe 已不存在' (-not (Test-Path -LiteralPath $oldExe)) $oldExe
+
+          # 2) brand.json(客户端 brand.py 第一优先级)
+          $bj = Join-Path $app 'brand.json'
+          if (Test-Path -LiteralPath $bj) {
+            $brand = Get-Content -LiteralPath $bj -Raw -Encoding UTF8 | ConvertFrom-Json
+            $okCode = ($brand.agent_code -eq $env:EXPECT_AGENT_CODE)
+            if ($env:EXPECT_VERSION -ne '') { $okCode = $okCode -and ($brand.version -eq $env:EXPECT_VERSION) }
+            Add-Check 'brand.json 内容' $okCode `
+              ("agent_code={0} app_name={1} version={2} api_base={3}" -f `
+               $brand.agent_code, $brand.app_name, $brand.version, $brand.api_base)
+          } else {
+            Add-Check 'brand.json 存在' $false $bj
+          }
+
+          # 3) 客户端 exe 尾部 trailer(与 app/brand.py read_brand_tail 同规则: 标记+CRC)
+          if (Test-Path -LiteralPath $brandExe) {
+            $fs = [System.IO.File]::OpenRead($brandExe)
+            $read = [int][Math]::Min(2MB, $fs.Length)
+            $fs.Seek($fs.Length - $read, 'Begin') | Out-Null
+            $tail = New-Object byte[] $read
+            [void]$fs.Read($tail, 0, $read)
+            $fs.Close()
+            $enc = [System.Text.Encoding]::GetEncoding(28591)
+            $txt = $enc.GetString($tail)
+            $m1 = '<<<T15BRAND_V1>>>'
+            $m2 = '<<<T15BRAND_END>>>'
+            $pos = $txt.LastIndexOf($m1)
+            if ($pos -ge 0) {
+              $end = $txt.IndexOf($m2, $pos)
+              $jsonBytes = $enc.GetBytes($txt.Substring($pos + $m1.Length, $end - $pos - $m1.Length))
+              $crcHex = $txt.Substring($end + $m2.Length, 8)
+              # CRC32(与 zlib.crc32 一致) —— 必须全程 uint64 运算:
+              # PowerShell(5.1/7 都一样)把 0xEDB88320 解析成负 Int32(-306674912),
+              # 直接 [uint32] 强转会抛 "Cannot convert value -306674912",
+              # 导致 CRC 校验假失败(crc=0000003f)而 trailer 其实完好
+              # (2026-10-24 1.0.16 验证报告误判根因)。算法与 brand_reader.ps1 逐行一致。
+              $poly = [System.UInt32]::Parse('EDB88320', [System.Globalization.NumberStyles]::HexNumber)
+              $mask = [uint64]4294967295
+              $table = New-Object 'System.UInt32[]' 256
+              for ($i = 0; $i -lt 256; $i++) {
+                $c = [uint64]$i
+                for ($j = 0; $j -lt 8; $j++) {
+                  if (($c -band [uint64]1) -eq [uint64]1) {
+                    $c = (([uint64]$poly -bxor ($c -shr 1)) -band $mask)
+                  } else {
+                    $c = (($c -shr 1) -band $mask)
+                  }
+                }
+                $table[$i] = [uint32]$c
+              }
+              $crc = [uint64]4294967295
+              foreach ($b in $jsonBytes) {
+                $idx = [int](($crc -bxor [uint64]$b) -band [uint64]255)
+                $crc = (([uint64]($table[$idx]) -bxor ($crc -shr 8)) -band $mask)
+              }
+              $crc = (($crc -bxor $mask) -band $mask)
+              $calc = '{0:x8}' -f [uint32]$crc
+              $b2 = [System.Text.Encoding]::UTF8.GetString($jsonBytes) | ConvertFrom-Json
+              $okT = ($calc -eq $crcHex.ToLowerInvariant()) -and ($b2.agent_code -eq $env:EXPECT_AGENT_CODE)
+              Add-Check '客户端 exe 尾部 trailer(CRC+agent_code)' $okT `
+                ("crc={0}/{1} agent_code={2} app_name={3}" -f $calc, $crcHex, $b2.agent_code, $b2.app_name)
+            } else {
+              Add-Check '客户端 exe 尾部 trailer' $false '未找到 <<<T15BRAND_V1>>> 标记'
+            }
+
+            # 4) VersionInfo 品牌化(资源管理器悬停/属性页数据源)
+            $vi = (Get-Item -LiteralPath $brandExe).VersionInfo
+            $okVi = ($vi.ProductName -eq $env:EXPECT_APP_NAME) -and ($vi.FileDescription -eq $env:EXPECT_APP_NAME)
+            if ($env:EXPECT_VERSION -ne '') { $okVi = $okVi -and ($vi.ProductVersion -eq $env:EXPECT_VERSION) }
+            Add-Check '客户端 exe VersionInfo' $okVi `
+              ("ProductName={0} FileDescription={1} ProductVersion={2} FileVersion={3}" -f `
+               $vi.ProductName, $vi.FileDescription, $vi.ProductVersion, $vi.FileVersion)
+          }
+
+          # 4.5) 图标资源品牌化(字节级): exe 的每个 RT_ICON 必须来自 brand.ico
+          #      (icon_patch.ps1 用品牌图逐尺寸替换, 任一残留旧图标 = 用户看到默认图标)
+          $icoPath = Join-Path $app 'brand.ico'
+          if ((Test-Path -LiteralPath $brandExe) -and (Test-Path -LiteralPath $icoPath)) {
+            $iconPy = @'
+          import sys, hashlib, struct
+          exe, ico = sys.argv[1], sys.argv[2]
+          data = open(exe, 'rb').read()
+          import pefile
+          pe = pefile.PE(exe, fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+          icons = []
+          for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              if typ.id != 3:
+                  continue
+              for nm in typ.directory.entries:
+                  for lg in nm.directory.entries:
+                      d = lg.data.struct
+                      off = pe.get_offset_from_rva(int(d.OffsetToData))
+                      icons.append(hashlib.sha256(data[off:off + int(d.Size)]).hexdigest())
+          blob = open(ico, 'rb').read()
+          cnt = struct.unpack_from('<H', blob, 4)[0]
+          imgs = []
+          for i in range(cnt):
+              o = 6 + i * 16
+              sz = struct.unpack_from('<I', blob, o + 8)[0]
+              off = struct.unpack_from('<I', blob, o + 12)[0]
+              imgs.append(hashlib.sha256(blob[off:off + sz]).hexdigest())
+          missing = [h for h in icons if h not in imgs]
+          print('exe_icons=%d brand_images=%d missing=%d' % (len(icons), len(imgs), len(missing)))
+          sys.exit(0 if icons and not missing else 2)
+          '@
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'check_icon.py') -Value $iconPy -Encoding ASCII
+            python -m pip install --quiet pefile 2>&1 | Out-Null
+            $outIcon = python (Join-Path $env:RUNNER_TEMP 'check_icon.py') $brandExe $icoPath 2>&1
+            $iconRc = $LASTEXITCODE
+            Add-Check '客户端 exe 图标=品牌 logo(字节级)' ($iconRc -eq 0) (($outIcon | Out-String).Trim())
+          } else {
+            Add-Check '客户端 exe 图标=品牌 logo(字节级)' $false "missing client exe or brand.ico"
+          }
+
+          # 4.7) 桌面快捷方式: 目标=品牌 exe 且 IconLocation 钉到 brand.ico
+          #      (2026-10-27 修复: [Icons] 建快捷方式早于图标替换, shell 图标缓存
+          #       让桌面一直显示默认图标 → ssPostInstall 里 shortcut_fix.ps1 重写
+          #       .lnk 并钉图标)。
+          #      注意: 本检查只作【信息级】输出 —— GH runner 的非交互会话里
+          #      WScript.Shell COM 不可靠(读现有 .lnk 返回空对象), 不能据此判
+          #      FAIL; 真实桌面安装日志里有 shortcut_fix 的写后回读结果。
+          $desk = [Environment]::GetFolderPath('CommonDesktopDirectory')
+          $lnkPath = Join-Path $desk ($env:EXPECT_APP_NAME + '.lnk')
+          function Find-Bytes([byte[]]$hay, [byte[]]$needle) {
+            for ($i = 0; $i -le $hay.Length - $needle.Length; $i++) {
+              $m = $true
+              for ($j = 0; $j -lt $needle.Length; $j++) {
+                if ($hay[$i + $j] -ne $needle[$j]) { $m = $false; break }
+              }
+              if ($m) { return $true }
+            }
+            return $false
+          }
+          if (Test-Path -LiteralPath $lnkPath) {
+            $exeName = $env:EXPECT_APP_NAME + '.exe'
+            $tp = ''
+            $il = ''
+            try {
+              $ws = New-Object -ComObject WScript.Shell
+              $lnk = $ws.CreateShortcut($lnkPath)
+              $tp = [string]$lnk.TargetPath
+              $il = [string]$lnk.IconLocation
+            } catch { Write-Host ("WScript COM read failed: {0}" -f $_.Exception.Message) }
+            $raw = [System.IO.File]::ReadAllBytes($lnkPath)
+            if ($tp -ne '') {
+              $okT = ($tp -ieq (Join-Path $app $exeName))
+              Write-Host ("[INFO] 桌面快捷方式 TargetPath={0} (期望 {1})" -f $tp, (Join-Path $app $exeName))
+              Write-Host ("[INFO] 桌面快捷方式 IconLocation={0}" -f $il)
+            } else {
+              # COM 读取为空(runner 已知问题) → .lnk 字节级兜底: 目标 exe 名与
+              # brand.ico 必须以 UTF-16LE/ANSI 形式存在于 .lnk 文件
+              $exeU = [System.Text.Encoding]::Unicode.GetBytes($exeName)
+              $exeOk = (Find-Bytes $raw $exeU) -or (Find-Bytes $raw ([System.Text.Encoding]::ASCII.GetBytes($exeName)))
+              $icoOk = (Find-Bytes $raw ([System.Text.Encoding]::Unicode.GetBytes('brand.ico'))) -or
+                       (Find-Bytes $raw ([System.Text.Encoding]::ASCII.GetBytes('brand.ico')))
+              Write-Host ("[INFO] 桌面快捷方式 COM 读取为空(runner 已知), 字节级扫描: 目标exe={0} brand.ico={1} lnk_size={2}" -f `
+                $(if ($exeOk) { 'FOUND' } else { 'MISSING' }), $(if ($icoOk) { 'FOUND' } else { 'MISSING' }), $raw.Length)
+            }
+          } else {
+            Write-Host "[INFO] 桌面快捷方式不存在: $lnkPath"
+          }
+
+          # 4.8) PyInstaller PKG 完整性(2026-10-27 新增, 1.0.20 用户实测启动即挂
+          #      "Could not load PyInstaller's embedded PKG archive": UpdateResource
+          #      丢了 overlay + trailer 又盲追加在 cookie 之后)。客户端引导器从
+          #      【最后 88 字节】读 cookie 并按 archive_start = filesize - pkglen
+          #      定位归档; 这里逐字段验证安装后的品牌 exe 引导器数学成立。
+          if (Test-Path -LiteralPath $brandExe) {
+            $pkgPy = @'
+          import struct, sys
+          data = open(sys.argv[1], 'rb').read()
+          if len(data) < 88:
+              sys.exit('file too small')
+          ck = data[-88:]
+          if ck[:8] != b'MEI\x0c\x0b\x0a\x0b\x0e':
+              sys.exit('PyInstaller cookie magic NOT at EOF (bootloader would fail): %r' % ck[:8])
+          pkglen, toc, toclen = struct.unpack_from('>III', ck, 8)
+          pylib = ck[24:88].rstrip(b'\x00')
+          if not (88 <= pkglen <= len(data)):
+              sys.exit('cookie pkglen %d invalid for filesize %d' % (pkglen, len(data)))
+          if toc + toclen > pkglen:
+              sys.exit('cookie toc %d+%d exceeds pkglen %d' % (toc, toclen, pkglen))
+          arch_start = len(data) - pkglen
+          print('cookie OK: pkglen=%d toc=%d toclen=%d pylib=%r archive_start=%d filesize=%d'
+                % (pkglen, toc, toclen, pylib, arch_start, len(data)))
+          '@
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'check_pkg.py') -Value $pkgPy -Encoding ASCII
+            $outPkg = python (Join-Path $env:RUNNER_TEMP 'check_pkg.py') $brandExe 2>&1
+            $pkgRc = $LASTEXITCODE
+            Add-Check '客户端 exe PyInstaller PKG 完整性(可启动)' ($pkgRc -eq 0) (($outPkg | Out-String).Trim())
+          } else {
+            Add-Check '客户端 exe PyInstaller PKG 完整性(可启动)' $false 'missing client exe'
+          }
+
+          # 5) Chromium 落地约定路径
+          $chrome1 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win\chrome.exe'
+          $chrome2 = Join-Path $env:LOCALAPPDATA 'ms-playwright\chromium-1134\chrome-win64\chrome.exe'
+          Add-Check 'Chromium 落地约定路径' ((Test-Path $chrome1) -or (Test-Path $chrome2)) $chrome1
+
+          # 6) 卸载注册表 DisplayName = 品牌名
+          $un = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{9A6F2C41-3D7E-4B5A-8F0C-1D2E3B4C5A6B}_is1' -ErrorAction SilentlyContinue
+          Add-Check '卸载表 DisplayName=品牌名' ($un.DisplayName -eq $env:EXPECT_APP_NAME) "DisplayName=$($un.DisplayName)"
+
+          Write-Host ''
+          Write-Host '========== 验证报告 =========='
+          $script:report | Write-Host
+          $rp = Join-Path $env:RUNNER_TEMP 'verify_report.txt'
+          $script:report | Out-File -FilePath $rp -Encoding utf8
+          Get-ChildItem -LiteralPath $app -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table | Out-String | Out-File `
+            (Join-Path $env:RUNNER_TEMP 'app_dir_listing.txt') -Encoding utf8
+          if ($script:failed) { throw '存在 FAIL 项, 根因详见上方报告与安装日志' }
+          Write-Host '全部验证项 PASS'
+
+      # 资源级取证(2026-10-24): 1.0.16 真机报告里"尾部 trailer CRC"是校验脚本自身
+      # CRC32 溢出造成的假失败; VersionInfo 仍为默认值则是真实失败。这里在卸载前把
+      # 安装后的客户端 exe 完整拷贝出来, 并用 pefile 权威解析资源目录
+      # (type/name/lang/offset/size), 用于离线定位 icon_patch.ps1 的 RT_VERSION 写入落点。
+      - name: Resource forensics (before uninstall)
+        if: always()
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path 'forensics' | Out-Null
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $exe = Join-Path $app "$env:EXPECT_APP_NAME.exe"
+          if (Test-Path -LiteralPath $exe) { Copy-Item -LiteralPath $exe 'forensics\installed_client.exe' -Force }
+          foreach ($n in 'brand.ico', 'brand.json', 'brand.ini') {
+            $p = Join-Path $app $n
+            if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p ('forensics\' + $n) -Force }
+          }
+          if (Test-Path -LiteralPath $exe) {
+            $vi = (Get-Item -LiteralPath $exe).VersionInfo
+            @(
+              "ProductName=$($vi.ProductName)",
+              "FileDescription=$($vi.FileDescription)",
+              "CompanyName=$($vi.CompanyName)",
+              "ProductVersion=$($vi.ProductVersion)",
+              "FileVersion=$($vi.FileVersion)",
+              "OriginalFilename=$($vi.OriginalFilename)",
+              "Language=$($vi.Language)"
+            ) | Set-Content -LiteralPath 'forensics\versioninfo.txt' -Encoding UTF8
+          }
+          python -m pip install --quiet pefile 2>&1 | Out-Null
+          $py = @'
+          import json, sys
+          import pefile
+
+          path = sys.argv[1]
+          data = open(path, 'rb').read()
+          pe = pefile.PE(path, fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+          rows = []
+          for typ in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              tname = typ.id if typ.id is not None else str(typ.name)
+              for nm in typ.directory.entries:
+                  nname = nm.id if nm.id is not None else str(nm.name)
+                  for lg in nm.directory.entries:
+                      lname = lg.id if lg.id is not None else str(lg.name)
+                      d = lg.data.struct
+                      rows.append({'type': tname, 'name': nname, 'lang': lname,
+                                   'rva': int(d.OffsetToData), 'size': int(d.Size)})
+          print(json.dumps(rows, ensure_ascii=False, indent=1))
+          print('FILESIZE=%d' % len(data))
+          for row in rows:
+              if row['type'] != 16:
+                  continue
+              off = pe.get_offset_from_rva(row['rva'])
+              blob = data[off:off + row['size']]
+              print('RT_VERSION name=%s lang=%s size=%d fileoffset=%d' % (row['name'], row['lang'], row['size'], off))
+              for kw in ('VS_VERSION_INFO', 'StringFileInfo', 'StringTable', '080404b0', '040904b0',
+                         'ProductName', 'FileDescription', '2052', '1033'):
+                  print('  contains %-16s : %s' % (kw, kw.encode('utf-16-le') in blob))
+          '@
+          Set-Content -LiteralPath 'forensics\dump_res.py' -Value $py -Encoding ASCII
+          if (Test-Path -LiteralPath $exe) {
+            python 'forensics\dump_res.py' $exe 2>&1 | Tee-Object -FilePath 'forensics\resources.txt'
+          }
+          Get-ChildItem 'forensics' | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      # 7) 卸载链路真实验证(2026-10-24 用户实测 unins000 弹 "unknown constant
+      #    uninstalldisplayname" 的根因复现): 静默卸载必须退出码 0、无 unknown constant
+      #    报错、品牌名 exe / brand.json / brand.ico / brand.ini 补删干净。
+      - name: Run uninstaller (VERYSILENT, verify no unknown-constant error)
+        shell: pwsh
+        env:
+          EXPECT_APP_NAME: ${{ inputs.expect_app_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = Join-Path $env:ProgramFiles 'doubaoClient'
+          $unlog = Join-Path $env:RUNNER_TEMP 't15_uninstall.log'
+          $unexe = Join-Path $app 'unins000.exe'
+          if (-not (Test-Path -LiteralPath $unexe)) { throw "卸载器不存在: $unexe" }
+          $p = Start-Process -FilePath $unexe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$unlog" `
+            -Wait -PassThru
+          Write-Host "uninstaller exit code = $($p.ExitCode)"
+          if (Test-Path -LiteralPath $unlog) {
+            Write-Host '--- 卸载日志最后 120 行 ---'
+            Get-Content -LiteralPath $unlog -Tail 120 | Write-Host
+          } else {
+            Write-Host '!! 未生成卸载日志'
+          }
+          $script:failed = $false
+          if ($p.ExitCode -ne 0) { $script:failed = $true; Write-Host "!! 卸载退出码非 0: $($p.ExitCode)" }
+          $logText = if (Test-Path -LiteralPath $unlog) { Get-Content -LiteralPath $unlog -Raw } else { '' }
+          if ($logText -match 'unknown constant') {
+            $script:failed = $true
+            Write-Host "!! 卸载日志出现 unknown constant 报错(1.0.14 及之前用户实测问题未修复)"
+          } else {
+            Write-Host '卸载日志无 unknown constant 报错'
+          }
+          # 品牌补删清单落地检查
+          foreach ($n in @("$env:EXPECT_APP_NAME.exe", 'doubaoClient.exe', 'brand.json', 'brand.ico', 'brand.ini')) {
+            $t = Join-Path $app $n
+            if (Test-Path -LiteralPath $t) {
+              $script:failed = $true
+              Write-Host "!! 卸载后仍残留: $t"
+            } else {
+              Write-Host "卸载补删干净: $n"
+            }
+          }
+          Copy-Item -LiteralPath $unlog -Destination (Join-Path $env:RUNNER_TEMP 't15_uninstall.log') -ErrorAction SilentlyContinue
+          if ($script:failed) { throw '卸载验证存在 FAIL 项' }
+          Write-Host '卸载验证 PASS: 无 unknown constant, 品牌产物补删干净'
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-verify-evidence
+          path: |
+            ${{ runner.temp }}/t15_install.log
+            ${{ runner.temp }}/t15_uninstall.log
+            ${{ runner.temp }}/verify_report.txt
+            ${{ runner.temp }}/app_dir_listing.txt
+            forensics/
+          retention-days: 7
+          if-no-files-found: ignore
