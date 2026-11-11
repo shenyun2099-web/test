@@ -1,0 +1,287 @@
+# test15 客户端远程构建 workflow(由总后台「推送 Workflow」自动写入 GH 仓库, 不要手改这份以外的副本)
+#
+# 触发: 服务器 workflow_dispatch 下发 inputs(version / upload_token / site_url)
+# 流程: 下载服务器上的源码 zip → pip 依赖 → build_exe.py --installer(PyInstaller onedir + ISCC)
+#       → 分片回传安装包到服务器 /api/gh_build/{chunk,complete} → 落库为主模板
+# 说明: 中国服务器单连接收 200MB 级文件实测必超时(test10 教训), 因此按 8MB 分片 + 每片重试;
+#       产物同时传 GitHub artifact 兜底(保留 7 天), 服务器回传失败可人工取回。
+
+name: t15-client-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '客户端版本号(示例 1.0.0)'
+        required: true
+        default: '1.0.0'
+      upload_token:
+        description: 'test15 回传令牌(服务器自动下发)'
+        required: true
+      site_url:
+        description: 'test15 站点地址(示例 https://test15.5ghcy.com)'
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Ping server (fail fast on bad token)
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+        run: |
+          $r = curl.exe -sS --max-time 60 -H "X-T15-Token: $env:UPLOAD_TOKEN" "$env:SITE_URL/api/gh_build/ping"
+          Write-Host "ping => $r"
+          if ($r -notmatch '"code":0') { throw "服务器连通/令牌校验失败: $r" }
+
+      - name: Download client source from server
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+            Write-Host "download try $i ..."
+            curl.exe -sS --max-time 600 -o client-src.zip "$env:SITE_URL/api/gh_build/source?token=$env:UPLOAD_TOKEN"
+            $sz = (Test-Path client-src.zip) ? (Get-Item client-src.zip).Length : 0
+            Write-Host "curl exit=$LASTEXITCODE zip size=$sz"
+            # 跨太平洋链路偶发截断(curl 18), 差几 KB 也过不了 size 关 → 必须验 zip 中央目录
+            if ($sz -gt 100000 -and $LASTEXITCODE -eq 0) {
+              try {
+                $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path client-src.zip))
+                $n = $z.Entries.Count; $z.Dispose()
+                if ($n -gt 10) { Write-Host "zip OK, entries=$n"; $ok = $true; break }
+                Write-Host "zip entries=$n 异常偏少"
+              } catch { Write-Host "zip 损坏: $($_.Exception.Message)" }
+            }
+            Remove-Item client-src.zip -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { throw '下载客户端源码 zip 失败(重试后仍不完整)' }
+          Expand-Archive client-src.zip -DestinationPath client-src -Force
+          Get-ChildItem client-src | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+      # 构建门禁: 用真正的 Windows PowerShell 5.1 跑一遍将要打进安装包的 brand_reader.ps1。
+      # 2026-10-24 教训: 脚本里的 [uint32]0xEDB88320 在 PS5.1 会抛 UInt32 溢出, 而 CI 的
+      # pwsh 7 静默通过 → 主模板"构建成功"但所有安装包品牌链路全废。此步骤失败即中止构建,
+      # 绝不产出装不上品牌的安装包。
+      - name: PS5.1 brand_reader self-test (build gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          if (-not (Test-Path -LiteralPath $ps51)) { throw 'Windows PowerShell 5.1 not found' }
+
+          # 合成安装包: PE 头似的垃圾 + 品牌 trailer; CRC 用 python zlib(权威实现)生成
+          $py = @'
+          import zlib, json, base64, struct
+          brand = {
+              "app_name": "\u8c46\u5305\u6d4b\u8bd5\u54c1\u724c",
+              "agent_code": "AGTEST",
+              "version": "9.9.9",
+              "site_url": "https://example.test",
+              "icon_ico_b64": base64.b64encode(bytes(range(256)) * 2).decode(),
+          }
+          jb = json.dumps(brand, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+          crc = "%08x" % (zlib.crc32(jb) & 0xFFFFFFFF)
+          head = b"MZ" + b"\x00" * 2048
+          open("test_brand.exe", "wb").write(head + b"\n<<<T15BRAND_V1>>>" + jb + b"<<<T15BRAND_END>>>" + crc.encode() + b"\n")
+          # 2026-10-27: 客户端靶子带真实 PyInstaller 尾部结构([假归档][88B cookie]),
+          # 用于验证 brand_reader -AppendToExe 的 cookie 感知回写(1.0.14..1.0.20
+          # 把 trailer 盲追加到 cookie 之后, 客户端启动即挂 "Could not load
+          # PyInstaller's embedded PKG archive from the executable")
+          arch = b"FAKEPYIARCHIVE" * 16
+          body_len = 17 + len(jb) + 18 + 8          # V1 mark + json + END mark + crc8
+          pkglen1 = len(arch) + 88 + body_len + 2 + 88   # 追加后应有的 pkglen
+          cookie = b"MEI\x0c\x0b\x0a\x0b\x0e" + struct.pack(">IIIi", len(arch) + 88, 0, len(arch), 311) + b"python313.dll".ljust(64, b"\x00")
+          open("test_client.exe", "wb").write(head + arch + cookie)
+          open("expected_pkglen.txt", "wb").write(str(pkglen1).encode())
+          open("test_expect.json", "wb").write(jb)
+          print("crc", crc, "json_len", len(jb), "pkglen1", pkglen1)
+          '@
+          Set-Content -LiteralPath 'make_test.py' -Value $py -Encoding ASCII
+          python make_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'synthetic trailer generation failed' }
+
+          New-Item -ItemType Directory -Force -Path 'ps51out' | Out-Null
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out'
+          $rc = $LASTEXITCODE
+          Write-Host "PS5.1 brand_reader exit=$rc"
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace | ForEach-Object { Write-Host "TRACE $_" } }
+          if ($rc -ne 0) { throw "brand_reader failed under PS5.1 (exit $rc)" }
+
+          foreach ($f in 'brand.json', 'brand.ini', 'brand.ico') {
+            if (-not (Test-Path -LiteralPath (Join-Path 'ps51out' $f))) { throw "missing $f" }
+          }
+          $got = [System.IO.File]::ReadAllBytes((Resolve-Path 'ps51out/brand.json'))
+          $exp = [System.IO.File]::ReadAllBytes((Resolve-Path 'test_expect.json'))
+          if ($got.Length -ne $exp.Length) { throw 'brand.json size mismatch' }
+          for ($i = 0; $i -lt $exp.Length; $i++) {
+            if ($got[$i] -ne $exp[$i]) { throw "brand.json byte mismatch at offset $i" }
+          }
+          $ini = [System.IO.File]::ReadAllText((Resolve-Path 'ps51out/brand.ini'), [System.Text.Encoding]::Unicode)
+          Write-Host "brand.ini => $($ini -replace "`r`n", ' | ')"
+          if ($ini -notmatch 'agent_code=AGTEST') { throw 'brand.ini agent_code wrong' }
+          if ($ini -notmatch ('app_name=' + [char]0x8C46 + [char]0x5305)) { throw 'brand.ini app_name lost non-ASCII' }
+          if ($ini -notmatch 'has_logo=True') { throw 'brand.ini has_logo wrong' }
+          if ((Get-Item 'ps51out/brand.ico').Length -ne 512) { throw 'brand.ico content wrong' }
+
+          # 第二注入通道: trailer 追加到客户端 exe 尾部 (+ 幂等性)
+          New-Item -ItemType Directory -Force -Path 'ps51out2' | Out-Null
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
+          if ($LASTEXITCODE -ne 0) { throw "append channel failed (exit $LASTEXITCODE)" }
+
+          # 2026-10-27: cookie 感知回写验证 —— 追加后 PyInstaller cookie 必须仍在
+          # EOF 且 pkglen 已按 [trailer]+[cookie] 调整, 否则客户端引导器启动即挂
+          $py2 = @'
+          import struct, sys
+          expect = int(open("expected_pkglen.txt").read().strip())
+          data = open("test_client.exe", "rb").read()
+          ck = data[-88:]
+          if ck[:8] != b"MEI\x0c\x0b\x0a\x0b\x0e":
+              sys.exit("cookie magic not at EOF: %r" % ck[:8])
+          pkglen, toc, toclen = struct.unpack_from(">III", ck, 8)
+          if pkglen != expect:
+              sys.exit("cookie pkglen %d != expected %d" % (pkglen, expect))
+          if toc + toclen > pkglen:
+              sys.exit("cookie toc/toclen invalid: %d+%d > %d" % (toc, toclen, pkglen))
+          print("pyinstaller cookie verified at EOF, pkglen=%d (expect %d)" % (pkglen, expect))
+          '@
+          Set-Content -LiteralPath 'verify_cookie.py' -Value $py2 -Encoding ASCII
+          python verify_cookie.py
+          if ($LASTEXITCODE -ne 0) { throw 'PyInstaller cookie-aware append failed (client would not boot)' }
+
+          $before = (Get-Item 'test_client.exe').Length
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File 'client-src/installer/brand_reader.ps1' -ExePath 'test_brand.exe' -OutDir 'ps51out2' -AppendToExe 'test_client.exe'
+          if ($LASTEXITCODE -ne 0) { throw "append idempotent run failed (exit $LASTEXITCODE)" }
+          $after = (Get-Item 'test_client.exe').Length
+          if ($before -ne $after) { throw "append not idempotent ($before -> $after)" }
+          $cb = [System.IO.File]::ReadAllBytes((Resolve-Path 'test_client.exe').Path)
+          $stop = $cb.Length
+          $tailLen = [Math]::Min(65536, $stop)
+          $tailBuf = New-Object byte[] $tailLen
+          [Array]::Copy($cb, $stop - $tailLen, $tailBuf, 0, $tailLen)
+          $tailStr = [System.Text.Encoding]::GetEncoding(28591).GetString($tailBuf)
+          if (-not $tailStr.Contains('<<<T15BRAND_V1>>>')) { throw 'appended trailer missing on client exe' }
+
+          # 2026-10-27: shortcut_fix.ps1 PS5.1 门禁(写后回读, 失败即中止构建)。
+          # 与真实安装器一致: 全部传绝对路径(相对路径下 WScript Save() 不可靠)
+          New-Item -ItemType Directory -Force -Path 'ps51sc' | Out-Null
+          $scRoot = (Get-Location).Path
+          $dummy = Join-Path $scRoot 'ps51sc\brandtest.exe'
+          $dummyBytes = New-Object byte[] 128
+          $dummyBytes[0] = 0x4D; $dummyBytes[1] = 0x5A
+          [System.IO.File]::WriteAllBytes($dummy, $dummyBytes)
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scRoot 'client-src\installer\shortcut_fix.ps1') `
+            -LnkPath (Join-Path $scRoot 'ps51sc\test.lnk') -Target $dummy -WorkDir (Join-Path $scRoot 'ps51sc') `
+            -IconPath (Join-Path $scRoot 'client-src\installer\default.ico') -Description '品牌测试'
+          $scRc = $LASTEXITCODE
+          Get-ChildItem 'ps51sc' | ForEach-Object { Write-Host ("  {0} {1}" -f $_.Name, $_.Length) }
+          # 仅警告不阻断: GH runner 的非交互会话里 WScript.Shell COM 不可靠
+          # (2026-10-27 实测: 存在的 .lnk 读回 TargetPath 为空 / Save 报
+          #  "Unable to save shortcut"), 用户真实桌面是该 COM 的常规使用场景,
+          # 脚本自身的写后回读会在真实安装时给出准确结果并写入安装日志。
+          if ($scRc -ne 0) { Write-Host "!! shortcut_fix exit $scRc (runner COM 已知不可靠, 仅警告)" }
+          else { Write-Host 'PS5.1 shortcut_fix self-test PASS' }
+          # GH Actions 的 pwsh 包装器会把最后一条原生命令的 LASTEXITCODE 作为步骤
+          # 退出码 —— 上面 shortcut_fix 故意失败(warn-only), 必须清零, 否则步骤假失败
+          $global:LASTEXITCODE = 0
+          Write-Host 'PS5.1 brand_reader self-test PASS'
+
+      - name: Install dependencies
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r client-src/requirements.txt
+          python -c "import PyInstaller, webview, playwright; print('deps ok')"
+
+      - name: Build master installer
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: 'utf-8'
+          SITE_URL: ${{ inputs.site_url }}
+        run: |
+          Set-Location client-src
+          python build_exe.py --installer --version "${{ inputs.version }}" --site-url "$env:SITE_URL"
+
+      - name: Upload installer to server (chunked, resumable)
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          UPLOAD_TOKEN: ${{ inputs.upload_token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem "client-src/installer_out/doubao-*.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw '未找到安装器产物 client-src/installer_out/doubao-*.exe' }
+          Write-Host ("artifact: {0} size={1}" -f $exe.Name, $exe.Length)
+          $api = "$env:SITE_URL/api/gh_build"
+          $uploadId = -join ((1..24) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+          $fullSha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $chunkSize = 8MB
+          $total = [int][math]::Ceiling($bytes.Length / $chunkSize)
+          function Invoke-Retry([scriptblock]$s) {
+            for ($a = 1; $a -le 6; $a++) {
+              try { return & $s } catch { Write-Host "attempt $a failed: $_"; Start-Sleep -Seconds (15 * $a) }
+            }
+            throw '分片重试次数耗尽'
+          }
+          for ($i = 0; $i -lt $total; $i++) {
+            $take = [int][math]::Min($chunkSize, $bytes.Length - $i * $chunkSize)
+            $chunk = New-Object byte[] $take
+            [Array]::Copy($bytes, $i * $chunkSize, $chunk, 0, $take)
+            $tmp = Join-Path $env:TEMP "c$i.bin"
+            [System.IO.File]::WriteAllBytes($tmp, $chunk)
+            $sha = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("chunk {0}/{1} size={2} sha={3}" -f ($i + 1), $total, $take, $sha.Substring(0, 12))
+            $tmpUrl = ($tmp -replace '\\', '/')
+            Invoke-Retry {
+              $r = curl.exe -sS --max-time 900 -H "X-T15-Token: $env:UPLOAD_TOKEN" `
+                -F "upload_id=$uploadId" -F "index=$($i + 1)" -F "total=$total" `
+                -F "sha256=$sha" -F "file=@$tmpUrl" "$api/chunk"
+              Write-Host $r
+              if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+              if ($r -notmatch '"code":0') { throw "分片被拒绝: $r" }
+            }
+            Remove-Item $tmp -Force
+          }
+          Write-Host 'all chunks uploaded, completing...'
+          Invoke-Retry {
+            $r = curl.exe -sS --max-time 300 -H "X-T15-Token: $env:UPLOAD_TOKEN" `
+              -F "upload_id=$uploadId" -F "version=$env:VERSION" -F "total_chunks=$total" `
+              -F "size=$($bytes.Length)" -F "sha256=$fullSha" `
+              -F "run_url=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" `
+              "$api/complete"
+            Write-Host $r
+            if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+            if ($r -notmatch '"code":0') { throw "合并入库失败: $r" }
+          }
+          Write-Host 'master template uploaded to server OK'
+
+      - name: Upload artifact backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doubao-${{ inputs.version }}
+          path: client-src/installer_out/*.exe
+          retention-days: 7
+          if-no-files-found: ignore
