@@ -1,0 +1,156 @@
+# t15 品牌诊断 v3 (2026-10-24)
+# 目的: 一次性拿到 brand_reader.ps1 在 Windows PowerShell 5.1 下的真实失败原因:
+#   1) PS5.1 Parser::ParseFile 语法错误列表 (区分"解析期死亡"与"运行期退出")
+#   2) 用正确引号方式(单字符串 ArgumentList / 调用运算符)直接运行 shipped 脚本,
+#      抓 stdout / stderr / 退出码 (v2 diag 的 Start-Process 数组参数未加引号,
+#      路径含空格时被拆成 "C:\Program", 那是 diag 自身的 bug)
+#   3) 安装期 trace 日志 %LOCALAPPDATA%\ms-playwright\doubao_brand_reader.log
+#   4) 安装包尾部 trailer 是否存在 / diagout 产物
+# 触发: 服务器 workflow_dispatch 下发 inputs
+name: t15-brand-diag3
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'test15 站点地址'
+        required: true
+      agent_token:
+        description: '代理下载令牌(短TTL)'
+        required: true
+      build_id:
+        description: 'builds.id'
+        required: true
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Download installer artifact
+        shell: pwsh
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          AGENT_TOKEN: ${{ inputs.agent_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          curl.exe -sS -L --retry 3 --connect-timeout 30 --max-time 1500 -o installer.exe "$env:SITE_URL/agent/build/download?id=$env:BUILD_ID&token=$env:AGENT_TOKEN"
+          $sz = (Get-Item 'installer.exe').Length
+          Write-Host "installer size=$sz"
+          if ($sz -lt 100MB) { throw 'download failed' }
+
+      - name: Trailer sanity check on installer exe
+        shell: pwsh
+        run: |
+          $b = [System.IO.File]::ReadAllBytes((Resolve-Path 'installer.exe').Path)
+          $tailLen = [Math]::Min(2097152, $b.Length)
+          $tail = New-Object byte[] $tailLen
+          [Array]::Copy($b, $b.Length - $tailLen, $tail, 0, $tailLen)
+          $s = [System.Text.Encoding]::GetEncoding(28591).GetString($tail)
+          $p = $s.LastIndexOf('<<<T15BRAND_V1>>>')
+          $e = if ($p -ge 0) { $s.IndexOf('<<<T15BRAND_END>>>', $p) } else { -1 }
+          Write-Host "tail bytes=$tailLen marker_pos=$p end_pos=$e"
+          if ($p -ge 0 -and $e -gt $p) {
+            $crc = $s.Substring($e + 18, 8)
+            $js = $s.Substring($p + 17, $e - $p - 17)
+            Write-Host "trailer json_len=$($js.Length) crc=$crc"
+            Write-Host ("trailer head: " + $js.Substring(0, [Math]::Min(220, $js.Length)))
+          } else {
+            Write-Host '!! NO trailer found in installer tail'
+          }
+
+      - name: Silent install (captures install-time brand trace)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 't15_install.log'
+          $p = Start-Process -FilePath (Resolve-Path 'installer.exe').Path -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -Wait -PassThru
+          Write-Host "installer exit=$($p.ExitCode)"
+          Write-Host '--- install log brand lines ---'
+          if (Test-Path $log) { Get-Content -LiteralPath $log | Where-Object { $_ -match 'brand|品牌|trailer' } | ForEach-Object { Write-Host $_ } }
+          Write-Host '--- install-time brand trace ---'
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace | ForEach-Object { Write-Host $_ } } else { Write-Host '!! trace log NOT created' }
+
+      - name: PS5.1 parse check + real run of shipped script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $shipped = Join-Path $env:ProgramFiles 'doubaoClient\brand_reader.ps1'
+          Write-Host "ps51=$ps51"
+          Write-Host "shipped=$shipped exists=$(Test-Path -LiteralPath $shipped)"
+          if (-not (Test-Path -LiteralPath $shipped)) { throw 'shipped script missing' }
+          $bytes = [System.IO.File]::ReadAllBytes($shipped)
+          Write-Host ("shipped bytes={0} bom={1}" -f $bytes.Length, (($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)))
+
+          # ---- 1) PS5.1 parser ----
+          $pc = Join-Path $env:RUNNER_TEMP 'parsecheck.ps1'
+          $lines = @(
+            'param([string]$Target)',
+            '$errs = $null',
+            '$toks = $null',
+            '$ast = [System.Management.Automation.Language.Parser]::ParseFile($Target, [ref]$toks, [ref]$errs)',
+            'Write-Host ("PSVERSION=" + $PSVersionTable.PSVersion.ToString())',
+            'Write-Host ("parser tokens=" + $toks.Count + " errors=" + $errs.Count)',
+            'foreach ($e in $errs) { Write-Host ("PARSE ERR line " + $e.Extent.StartLineNumber + " col " + $e.Extent.StartColumnNumber + " : " + $e.Message) }'
+          )
+          Set-Content -LiteralPath $pc -Value ($lines -join "`r`n") -Encoding ASCII
+          & $ps51 -NoProfile -ExecutionPolicy Bypass -File $pc -Target $shipped 2>&1 | ForEach-Object { Write-Host $_ }
+          Write-Host "parsecheck exit=$LASTEXITCODE"
+
+          # ---- 2) execution policy ----
+          & $ps51 -NoProfile -Command 'Get-ExecutionPolicy -List | Format-Table -AutoSize | Out-String | Write-Host' 2>&1 | ForEach-Object { Write-Host $_ }
+
+          # ---- 3) real run: Start-Process single-string args ----
+          New-Item -ItemType Directory -Force -Path 'diagout' | Out-Null
+          $installer = (Resolve-Path 'installer.exe').Path
+          $outDir = (Resolve-Path 'diagout').Path
+          $out = Join-Path $env:RUNNER_TEMP 'ps51_out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'ps51_err.txt'
+          $argStr = '-NoProfile -ExecutionPolicy Bypass -File "' + $shipped + '" -ExePath "' + $installer + '" -OutDir "' + $outDir + '"'
+          Write-Host "CMDLINE: $ps51 $argStr"
+          $p = Start-Process -FilePath $ps51 -ArgumentList $argStr -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+          Write-Host "RUN-A exit=$($p.ExitCode)"
+          Write-Host '--- A stdout ---'
+          if (Test-Path $out) { Get-Content -LiteralPath $out | ForEach-Object { Write-Host $_ } }
+          Write-Host '--- A stderr ---'
+          if (Test-Path $err) { Get-Content -LiteralPath $err | ForEach-Object { Write-Host $_ } }
+
+          # ---- 4) real run: call operator (exact quoting) ----
+          $out2 = Join-Path $env:RUNNER_TEMP 'ps51_out2.txt'
+          $err2 = Join-Path $env:RUNNER_TEMP 'ps51_err2.txt'
+          $p2 = Start-Process -FilePath $ps51 -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -Command "& { & ''' + $shipped + ''' -ExePath ''' + $installer + ''' -OutDir ''' + $outDir + ''' }"') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out2 -RedirectStandardError $err2
+          Write-Host "RUN-B exit=$($p2.ExitCode)"
+          Write-Host '--- B stdout ---'
+          if (Test-Path $out2) { Get-Content -LiteralPath $out2 | ForEach-Object { Write-Host $_ } }
+          Write-Host '--- B stderr ---'
+          if (Test-Path $err2) { Get-Content -LiteralPath $err2 | ForEach-Object { Write-Host $_ } }
+
+          Write-Host '--- trace after direct runs ---'
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace | ForEach-Object { Write-Host $_ } } else { Write-Host '!! trace log NOT created' }
+          Write-Host '--- diagout ---'
+          Get-ChildItem 'diagout' | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Copy evidence to workspace
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'evidence' | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 't15_install.log') 'evidence\' -Force -ErrorAction SilentlyContinue
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'ps51_*.txt') 'evidence\' -Force -ErrorAction SilentlyContinue
+          $trace = Join-Path $env:LOCALAPPDATA 'ms-playwright\doubao_brand_reader.log'
+          Copy-Item $trace 'evidence\' -Force -ErrorAction SilentlyContinue
+          Copy-Item (Join-Path $env:ProgramFiles 'doubaoClient\brand_reader.ps1') 'evidence\shipped_brand_reader.ps1' -Force -ErrorAction SilentlyContinue
+          Get-ChildItem 'evidence' | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brand-diag3-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: ignore
